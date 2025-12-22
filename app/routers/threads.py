@@ -5,7 +5,7 @@ from app.models.post import Post
 from app.schemas.thread import ThreadResponse, ThreadCreate
 from app.database import get_db
 from sqlalchemy.orm import Session
-from sqlalchemy import select, insert
+from sqlalchemy import select, insert,func,case,distinct,or_
 
 router = APIRouter(
     prefix="/threads",
@@ -15,42 +15,279 @@ router = APIRouter(
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import aliased
 
 templates = Jinja2Templates(directory="app/templates")
-# -----------------------------------
-# フロント側処理 一覧
-# -----------------------------------
-@router.get("/list", response_class=HTMLResponse)
-async def list_threads_page(request: Request, db: Session = Depends(get_db)):
 
-    # スレッドの一覧を新しい順に取得
-    stmt = select(Thread).order_by(Thread.created_at.desc())
-    threads = db.execute(stmt).scalars().all()
+# -----------------------
+# 検索機能 GET /search
+# -----------------------
+@router.get("/search")
+async def search_threads(
+    request: Request,
+    keyword: str, #　検索キーワード
+    page: int = 1,
+    db: Session = Depends(get_db)
+):
 
-    # --- 最新投稿10件を取得（ThreadとJOIN） ---
-    stmt_posts = (
+    limit = 20
+
+    offset = (page - 1) * limit
+    like_word = f"%{keyword}%"  #　検索キーワードを前後方一致で設定
+
+    # スレッドでの一致
+    hit_title = case(
+        (Thread.title.like(like_word), 1),
+        else_=0
+    ).label("hit_title")
+
+    # 投稿での一致
+    hit_post = case(
+        (
+            select(1)
+            .select_from(Post)
+            .where(
+                Post.thread_id == Thread.id,
+                Post.content.like(like_word)
+            )
+            .exists(),
+            1
+        ),
+        else_=0
+    ).label("hit_post")
+
+    stmt = (
+        select(
+            Thread,
+            hit_title,
+            hit_post
+        )
+        .where(
+            or_(
+                Thread.title.like(like_word),
+                select(1)
+                .select_from(Post)
+                .where(
+                    Post.thread_id == Thread.id,
+                    Post.content.like(like_word)
+                )
+                .exists()
+            )
+        )
+        .order_by(Thread.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+
+    results = db.execute(stmt).all()
+
+    # ---------------------------
+    # ② 件数カウント（ページ数計算用）
+    # ---------------------------
+    stmt_count = (
+        select(func.count(distinct(Thread.id)))
+        .outerjoin(Post, Post.thread_id == Thread.id)
+        .where( # 抽出条件
+            or_(    # OR で検索
+                Thread.title.like(like_word),   # タイトルで一致
+                Post.content.like(like_word)    # 投稿で一致
+            )
+        )
+    )
+
+    total_threads = db.execute(stmt_count).scalar_one()
+    total_pages = (total_threads + limit - 1) // limit
+
+    return templates.TemplateResponse(
+        "search_result.html",
+        {
+            "request": request,
+            "results": results, # 一致したスレッドデータ
+            "keyword": keyword, # 検索キーワード
+            "page": page,       # 現在のページ番号
+            "total_pages": total_pages, # 総ページ番号
+        }
+    )
+
+
+# -----------------------------------
+# フロント側処理 詳細
+# -----------------------------------
+@router.get("/{thread_id}/view", response_class=HTMLResponse)
+async def threads_detail_page(
+    request: Request,
+    thread_id: int,
+    page: int = 1,
+    post: int | None = None,
+    db: Session = Depends(get_db),
+):
+    limit = 10
+
+    # 特定の投稿番号が含まれるページを表示する
+    if post is not None:
+        page = ((post - 1) // limit) + 1
+
+    offset = (page - 1) * limit
+
+    # ───────────────
+    # ① Thread を取得
+    # ───────────────
+    thread = db.execute(
+        select(Thread).where(Thread.id == thread_id)
+    ).scalar_one_or_none()
+
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    # ───────────────
+    # ② 先頭投稿（post_number=1）
+    # ───────────────
+    ParentPost = aliased(Post)
+    first_post = db.execute(
         select(
             Post.id,
             Post.content,
             Post.author,
             Post.created_at,
             Post.attachment,
-            Thread.title.label("thread_title"),
-            Thread.id.label("thread_id")
+            Post.post_number,
+            ParentPost.post_number.label("parent_post_number"),
         )
-        .join(Thread, Thread.id == Post.thread_id)
-        .order_by(Post.created_at.desc())
-        .limit(10)
-    )
+        .outerjoin(ParentPost, ParentPost.id == Post.parent_post_id)
+        .where(
+            Post.thread_id == thread_id,
+            Post.post_number == 1,
+        )
+    ).first()
 
-    latest_posts = db.execute(stmt_posts).all()
+    # ───────────────
+    # ③ 2件目以降（ページネーション）
+    # ───────────────
+    posts = db.execute(
+        select(
+            Post.id,
+            Post.content,
+            Post.author,
+            Post.created_at,
+            Post.attachment,
+            Post.post_number,
+            ParentPost.post_number.label("parent_post_number"),
+        )
+        .outerjoin(ParentPost, ParentPost.id == Post.parent_post_id)
+        .where(
+            Post.thread_id == thread_id,
+            Post.post_number > 1,
+        )
+        .order_by(Post.post_number.asc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
 
+    # ───────────────
+    # ④ 総件数 → 総ページ数
+    # ───────────────
+    total_posts = db.execute(
+        select(func.count())
+        .where(
+            Post.thread_id == thread_id,
+            Post.post_number > 1,
+        )
+    ).scalar_one()
+
+    total_pages = (total_posts + limit - 1) // limit
+
+    # ───────────────
+    # ⑤ テンプレートへ
+    # ───────────────
     return templates.TemplateResponse(
-        "index.html",
-        {"request": request,
-        "threads": threads,
-        "latest_posts": latest_posts}
+        "thread/detail.html",
+        {
+            "request": request,
+            "thread": thread,
+            "first_post": first_post,
+            "posts": posts,
+            "page": page,
+            "total_pages": total_pages,
+            "search_mode": False,
+        }
     )
+
+
+# -----------------------------------
+# スレッド詳細（検索モード）
+# GET /threads/{thread_id}/view/{keyword}
+# -----------------------------------
+@router.get("/{thread_id}/view/{keyword}", response_class=HTMLResponse)
+async def thread_detail_search(
+    request: Request,
+    thread_id: int,
+    keyword: str,
+    db: Session = Depends(get_db),
+):
+    like_word = f"%{keyword}%"
+
+    # ---------------------------
+    # ① スレッド取得
+    # ---------------------------
+    thread = db.execute(
+        select(Thread).where(Thread.id == thread_id)
+    ).scalar_one_or_none()
+
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    # ---------------------------
+    # ② タイトル一致判定
+    # ---------------------------
+    title_hit = keyword in thread.title
+
+    # ---------------------------
+    # ③ 本文一致投稿を取得
+    # ---------------------------
+    posts = db.execute(
+        select(Post)
+        .where(
+            Post.thread_id == thread_id,
+            Post.content.like(like_word)
+        )
+        .order_by(Post.post_number.asc())
+    ).scalars().all()
+
+    # ---------------------------
+    # ④ タイトル一致なら先頭投稿を追加
+    # ---------------------------
+    if title_hit:
+        first_post = db.execute(
+            select(Post)
+            .where(
+                Post.thread_id == thread_id,
+                Post.post_number == 1
+            )
+        ).scalar_one_or_none()
+
+        if first_post:
+            # 先頭に追加（重複防止）
+            post_ids = {p.id for p in posts}
+            if first_post.id not in post_ids:
+                posts.insert(0, first_post)
+
+    # ---------------------------
+    # ⑤ 表示
+    # ---------------------------
+    return templates.TemplateResponse(
+        "thread/detail.html",
+        {
+            "request": request,
+            "thread": thread,
+            "posts": posts,
+            "search_mode": True,
+            "keyword": keyword,
+            "title_hit": title_hit,
+        }
+    )
+
+
 
 # -----------------------------------
 # フロント側処理 スレッドの新規作成画面を表示
@@ -131,6 +368,72 @@ async def create_thread_front(
 
 
 # -----------------------------------
+# フロント側処理 一覧（ページネーション対応）
+# -----------------------------------
+@router.get("/list", response_class=HTMLResponse)
+async def list_threads_page(
+    request: Request, 
+    page: int = 1, 
+    db: Session = Depends(get_db)
+):
+
+    limit = 20  # 1ページあたりの件数
+    offset = (page - 1) * limit
+
+    # -----------------------------------
+    # ① スレッド一覧（ページネーション付き）
+    # -----------------------------------
+    stmt_threads = (
+        select(Thread)
+        .order_by(Thread.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    threads = db.execute(stmt_threads).scalars().all()
+
+    # -----------------------------------
+    # ② スレッド総数を取得 → ページ数算出
+    # -----------------------------------
+    stmt_count = select(func.count()).select_from(Thread)
+    total_threads = db.execute(stmt_count).scalar_one()
+    total_pages = (total_threads + limit - 1) // limit
+
+    # -----------------------------------
+    # ③ 最新投稿10件（これはそのまま）
+    # -----------------------------------
+    stmt_posts = (
+        select(
+            Post.id,
+            Post.content,
+            Post.author,
+            Post.created_at,
+            Post.attachment,
+            Post.post_number,
+            Thread.title.label("thread_title"),
+            Thread.id.label("thread_id"),
+        )
+        .join(Thread, Thread.id == Post.thread_id)
+        .order_by(Post.created_at.desc())
+        .limit(10)
+    )
+    latest_posts = db.execute(stmt_posts).all()
+
+    # -----------------------------------
+    # ④ テンプレートへ渡す
+    # -----------------------------------
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "threads": threads,
+            "latest_posts": latest_posts,
+            "page": page,
+            "total_pages": total_pages,
+        }
+    )
+
+
+# -----------------------------------
 # スレッド一覧 GET /threads
 # -----------------------------------
 @router.get("/", response_model=list[ThreadResponse])
@@ -170,3 +473,50 @@ async def create_thread(thread: ThreadCreate,db: Session = Depends(get_db)):
     stmt2 = select(Thread).where(Thread.id == new_id)
     new_thread = db.execute(stmt2).scalar_one()
     return new_thread
+
+# -----------------------
+# ダミー投稿作成
+# POST /threads/gen_dummy_threads
+# -----------------------
+from faker import Faker
+fake = Faker("ja_JP")   # 日本語のデータを生成
+
+@router.post("/gen_dummy_threads")
+def generate_dummy_threads(
+    count: int = 100,               # ← デフォルト100件
+    db: Session = Depends(get_db)
+):
+    created_ids = []
+
+    for _ in range(count):
+        # ---------------------------------
+        # ① Thread 作成
+        # ---------------------------------
+        title = fake.sentence(nb_words=5)
+
+        stmt_thread = insert(Thread).values(title=title)
+        result = db.execute(stmt_thread)
+        thread_id = result.lastrowid
+
+        # ---------------------------------
+        # ② Post（最初の投稿 = post_number=1）
+        # ---------------------------------
+        content = fake.text(max_nb_chars=120)
+
+        stmt_post = insert(Post).values(
+            thread_id=thread_id,
+            content=content,
+            post_number=1,
+            author=fake.name(), # fakerライブラリ使用
+        )
+        db.execute(stmt_post)
+
+        created_ids.append(thread_id)
+
+    db.commit()
+
+    return {
+        "status":"ok",
+        "created_threads": len(created_ids),
+        "thread_ids": created_ids
+    }
